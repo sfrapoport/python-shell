@@ -1,31 +1,14 @@
-import signal
-import sys
-import os
+import signal, sys, os
+
+STDIN_OUT = ( 0, 1 )
+FDS_TO_CLOSE = []
 
 def read_in():
     sys.stdout.write('YO! >')
     content = sys.stdin.readline()[:-1]
     return content
 
-# First write for one command & one file to write to
-
-def write_handler(read_fd, args): 
-    commands = []
-    operations = []
-    for arg in args:
-        if arg == '>':
-            commands.append(operations)
-            operations = []
-        else:
-            operations.append(arg)
-    commands.append(operations)
-    waits = len(commands)
-    write_to = os.open(commands[1][0], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
-    command = commands[0]
-    write_from(command, read_fd, write_to)
-
-def pipe_handler(args):
-    # is there a way to do this more pythonically?
+def separate_by_pipe(args):
     commands = []
     operations = []
     for arg in args:
@@ -35,61 +18,122 @@ def pipe_handler(args):
         else:
             operations.append(arg)
     commands.append(operations)
-    waits = len(commands)
-    stdin_out = ( 0, 1 )
-    while len(commands) > 1:
-        if not 'next_pipe' in locals():
-            current_pipe = stdin_out
-        else: 
-            current_pipe = next_pipe
-            print 'current pipe: ', current_pipe
-        next_pipe = os.pipe()
-        command = commands[0]
-        commands = commands[1:]
-        write_from(command, current_pipe, next_pipe) 
-    command = commands[0]
-    if current_pipe != (0, 1): 
-        os.close(current_pipe[0])
-        os.close(current_pipe[1])
-    if '>' in command:
-        os.close(next_pipe[1])
-        write_handler(next_pipe[0], command)
-    else: 
-        write_from(command, next_pipe, stdin_out)
-    if next_pipe != (0, 1): 
-        os.close(next_pipe[1])
-        os.close(next_pipe[0])
-    print 'waiting for: ', waits, ' child processes'
-    for i in xrange(waits):
-        os.wait()
+    return commands
 
-def write_from(command, read_fd_or_pipe, write_fd_or_pipe):
-    if isinstance(read_fd_or_pipe, (list, tuple)):
-        read_fd = read_fd_or_pipe[0]
-    else:
-        read_fd = read_fd_or_pipe
-    if isinstance(write_fd_or_pipe, (list, tuple)):
-        write_fd = write_fd_or_pipe[1]
-    else: 
-        write_fd = write_fd_or_pipe
+def write_from(command, read_fd, write_fd, fds_to_close):
+    # print 'in write_from, running command: ', command
     write_process = os.fork()
     if write_process == 0:
+        # print 'WHY AM I NOT GETTING INTO THE CHILD PROCESS?!?!?!'
         exec_args = (command[0], command)
-        print 'file descriptors: ', read_fd, write_fd
-        os.dup2(write_fd, 1)
         os.dup2(read_fd, 0)
-        if isinstance(read_fd_or_pipe, (list, tuple)) and read_fd_or_pipe != (0, 1):
-            os.close(read_fd_or_pipe[0])
-            os.close(read_fd_or_pipe[1])
-        elif read_fd != 0: 
-            os.close(read_fd)
-        if isinstance(write_fd_or_pipe, (list, tuple)) and write_fd_or_pipe != (0, 1):
-            os.close(write_fd_or_pipe[0])
-            os.close(write_fd_or_pipe[1])
-        elif write_fd != 1: 
-            os.close(write_fd)
+        os.dup2(write_fd, 1)
+        #CLOSE ALL FDs before EXEC
+        #print 'closing fds before child process runs: ', fds_to_close
+        close_fds(fds_to_close)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         os.execvp(*exec_args)
+        
+def close_fds(fds):
+    for fd in fds:
+        if fd not in STDIN_OUT:
+            # print 'closing fd: ', fd
+            os.close(fd)
+
+def redirect_file_to_stdin(commands):
+    global FDS_TO_CLOSE
+    file_name = [elem[1] for elem in zip(commands, commands[1:])
+            if elem[0] == '<']
+    read_file = os.open(file_name[0], os.O_RDONLY)
+    print 'reading from file', read_file
+    pre_redirect_args = [cmd for index, cmd in enumerate(commands) 
+            if index < commands.index('<')]
+    print 'command ', pre_redirect_args
+    FDS_TO_CLOSE += [read_file]
+    write_from(pre_redirect_args, read_file, 1, [read_file])
+
+def redirect_stdout_to_file(commands): 
+    global FDS_TO_CLOSE
+    print FDS_TO_CLOSE
+    file_name = [elem[1] for elem in zip(commands, commands[1:])
+            if elem[0] == '>']
+    write_file = os.open(file_name[0], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+    print 'writing to file', write_file
+    pre_redirect_args = [cmd for index, cmd in enumerate(commands) 
+            if index < commands.index('>')]
+    FDS_TO_CLOSE += [write_file]
+    print 'command ', pre_redirect_args
+    write_from(pre_redirect_args, 0, write_file, [write_file])
+
+def run_all_commands(commands, write_fd=1):
+    global FDS_TO_CLOSE
+    print FDS_TO_CLOSE
+    print 'newest version'
+    
+    num_child_processes = len(commands)
+    # CASE: AT LEAST ONE PIPE...
+    while len(commands) > 1:
+        first_command = commands[0]
+        commands = commands[1:]
+        # CASE: FIRST command - get input to launch processes
+        if not 'next_pipe' in locals():
+            if '<' in first_command:
+                redirect_file_to_stdin(first_command)
+            current_pipe = STDIN_OUT
+        else: 
+            FDS_TO_CLOSE += current_pipe
+            current_pipe = next_pipe
+        next_pipe = os.pipe()
+        # Route read/write to file commands to handlers
+        print 'running first command', first_command
+        print 'writing from ', current_pipe[0], ' to ', next_pipe[1]
+        write_from(first_command, current_pipe[0], next_pipe[1], current_pipe + next_pipe) 
+
+    last_command = commands[0]
+
+    # CASE: ONLY COMMAND
+    if 'next_pipe' not in locals():
+        print 'only ONE command: ', last_command
+        if '<' in last_command:
+            redirect_file_to_stdin(last_command)
+            os.wait()
+        elif '>' in last_command:
+            redirect_stdout_to_file(last_command)
+            os.wait()
+        elif last_command[0] == 'cd':
+            print 'in cd handler'
+            os.chdir(os.path.abspath(last_command[1]))
+        else:
+            print 'in regular old process'
+            print last_command
+            newpid = os.fork() 
+            if newpid == 0:
+                if write_fd != 1:
+                    os.dup2(write_fd, 1)
+                    os.close(write_fd)
+                os.execvp(last_command[0], last_command)
+            os.wait()
+
+    # CASE: LAST COMMAND OF MULTIPLE
+    # REFACTOR: os.close handling, write_from behavior
+    else:
+        FDS_TO_CLOSE += current_pipe
+        print 'last command running', last_command
+        if '>' in last_command:
+            redirect_stdout_to_file(last_command)
+            os.wait()
+        else: 
+            print 'writing to stdout from: ', next_pipe[0]
+            write_from(last_command, next_pipe[0], write_fd, next_pipe)
+        FDS_TO_CLOSE += next_pipe
+        for fd in FDS_TO_CLOSE:
+            print fd, ' status ', os.fstat(fd)
+        close_fds([fd for ind, fd in enumerate(FDS_TO_CLOSE)
+            if FDS_TO_CLOSE.index(fd) == ind])
+        print 'waiting for: ', num_child_processes, ' child processes'
+        for i in xrange(num_child_processes):
+            os.wait()
+
 
 def main():
     while True:    
@@ -97,21 +141,8 @@ def main():
         if line == 'quit':
             return False
         args = line.split(' ')
-        cmd = args[0]
-        # To generalize, have to enable pipe to cooperate with other 
-        # file redirection (this might require returning to main)
-        if len(args) > 1 and '|' in args:
-            pipe_handler(args)
-        elif len(args) > 1 and '>' in args:
-            write_handler(0, args)
-            os.wait()
-        elif cmd == 'cd':
-            os.chdir(os.path.abspath(args[1]))
-        else:
-            newpid = os.fork() 
-            if newpid == 0:
-                os.execvp(args[0], args)
-            os.wait()
+        commands = separate_by_pipe(args)
+        run_all_commands(commands, 1)
 
 if __name__=='__main__':
     main()
