@@ -40,7 +40,8 @@ def close_fds(fds):
             # print 'closing fd: ', fd
             os.close(fd)
 
-def redirect_file_to_stdin(commands):
+# CHANGE NAME: should just be redirect_from_file
+def redirect_file_to_stdin(commands, write_to):
     global FDS_TO_CLOSE
     file_name = [elem[1] for elem in zip(commands, commands[1:])
             if elem[0] == '<']
@@ -50,11 +51,10 @@ def redirect_file_to_stdin(commands):
             if index < commands.index('<')]
     print 'command ', pre_redirect_args
     FDS_TO_CLOSE += [read_file]
-    write_from(pre_redirect_args, read_file, 1, [read_file])
-
-def redirect_stdout_to_file(commands): 
+    write_from(pre_redirect_args, read_file, write_to[1], write_to + (read_file,))
+# CHANGE NAME: should just be redirect_to_file
+def redirect_stdout_to_file(commands, read_from): 
     global FDS_TO_CLOSE
-    print FDS_TO_CLOSE
     file_name = [elem[1] for elem in zip(commands, commands[1:])
             if elem[0] == '>']
     write_file = os.open(file_name[0], os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
@@ -63,11 +63,11 @@ def redirect_stdout_to_file(commands):
             if index < commands.index('>')]
     FDS_TO_CLOSE += [write_file]
     print 'command ', pre_redirect_args
-    write_from(pre_redirect_args, 0, write_file, [write_file])
+    write_from(pre_redirect_args, read_from[0], write_file, read_from + (write_file,))
 
 def run_all_commands(commands, write_fd=1):
     global FDS_TO_CLOSE
-    print FDS_TO_CLOSE
+    FDS_TO_CLOSE = []
     print 'newest version'
     
     num_child_processes = len(commands)
@@ -78,27 +78,27 @@ def run_all_commands(commands, write_fd=1):
         # CASE: FIRST command - get input to launch processes
         if not 'next_pipe' in locals():
             if '<' in first_command:
-                redirect_file_to_stdin(first_command)
+                ++num_child_processes
+                redirect_file_to_stdin(first_command, STDIN_OUT)
             current_pipe = STDIN_OUT
         else: 
             FDS_TO_CLOSE += current_pipe
             current_pipe = next_pipe
         next_pipe = os.pipe()
         # Route read/write to file commands to handlers
-        print 'running first command', first_command
         print 'writing from ', current_pipe[0], ' to ', next_pipe[1]
         write_from(first_command, current_pipe[0], next_pipe[1], current_pipe + next_pipe) 
 
     last_command = commands[0]
 
-    # CASE: ONLY COMMAND
+    # CASE: NO PIPES
     if 'next_pipe' not in locals():
         print 'only ONE command: ', last_command
         if '<' in last_command:
-            redirect_file_to_stdin(last_command)
+            redirect_file_to_stdin(last_command, STDIN_OUT)
             os.wait()
         elif '>' in last_command:
-            redirect_stdout_to_file(last_command)
+            redirect_stdout_to_file(last_command, STDIN_OUT)
             os.wait()
         elif last_command[0] == 'cd':
             print 'in cd handler'
@@ -114,23 +114,20 @@ def run_all_commands(commands, write_fd=1):
                 os.execvp(last_command[0], last_command)
             os.wait()
 
-    # CASE: LAST COMMAND OF MULTIPLE
+    # CASE: LAST COMMAND AFTER PIPES    
     # REFACTOR: os.close handling, write_from behavior
     else:
         FDS_TO_CLOSE += current_pipe
         print 'last command running', last_command
         if '>' in last_command:
-            redirect_stdout_to_file(last_command)
-            os.wait()
+            ++num_child_processes
+            redirect_stdout_to_file(last_command, next_pipe)
         else: 
             print 'writing to stdout from: ', next_pipe[0]
             write_from(last_command, next_pipe[0], write_fd, next_pipe)
         FDS_TO_CLOSE += next_pipe
-        for fd in FDS_TO_CLOSE:
-            print fd, ' status ', os.fstat(fd)
         close_fds([fd for ind, fd in enumerate(FDS_TO_CLOSE)
             if FDS_TO_CLOSE.index(fd) == ind])
-        print 'waiting for: ', num_child_processes, ' child processes'
         for i in xrange(num_child_processes):
             os.wait()
 
